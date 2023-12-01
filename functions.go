@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"path/filepath"
@@ -78,4 +79,9 @@ func buildKubeClient(c *Config) (*kubernetes.Clientset, error) {
 		}
 	}
 	return kubernetes.NewForConfig(clusterConfig)
+}
+
+func prettyPrint(s interface{}) {
+	j, _ := json.MarshalIndent(s, "", "    ")
+	fmt.Print(string(j))
 }

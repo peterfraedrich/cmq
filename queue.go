@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -50,9 +52,12 @@ func (c *Cluster) NewQueue(name string) error {
 	if err != nil {
 		return err
 	}
-	cmap.BinaryData = map[string][]byte{}
-	cmap.BinaryData["idx"] = b
-	_, _ = q.Client.CoreV1().ConfigMaps(q.Config.Kube.Namespace).Create(context.TODO(), &cmap, metav1.CreateOptions{})
+	cmap.Data = map[string]string{}
+	cmap.Data["idx"] = string(b[:])
+	_, err = q.Client.CoreV1().ConfigMaps(q.Config.Kube.Namespace).Create(context.TODO(), &cmap, metav1.CreateOptions{})
+	if err != nil && err.Error() != fmt.Sprintf("configmaps \"%s\" already exists", cmapName) {
+		return err
+	}
 	return nil
 }
 
@@ -61,7 +66,7 @@ func (c *Cluster) GetQueue(name string) (*Queue, error) {
 	if val, ok := c.Queues[nameHash]; ok {
 		return val, nil
 	}
-	return nil, fmt.Errorf("Name %s does not exist", name)
+	return nil, fmt.Errorf("name %s does not exist", name)
 }
 
 func HashString(name string) string {
@@ -69,37 +74,63 @@ func HashString(name string) string {
 }
 
 func HashBytes(b []byte) string {
-	n := sha1.Sum(b)
-	return string(n[:])
+	h := sha1.New()
+	h.Write(b)
+	s := hex.EncodeToString(h.Sum(nil))
+	return s
 }
 
 type Queue struct {
 	Name   string
 	Index  []string
-	Length uint
+	Length int
 	Client *kubernetes.Clientset
 	Config *Config
 }
 
-func (q *Queue) GetQueueData() (idx []string, objects map[string][]byte, cm *v1.ConfigMap, err error) {
-	cmi, err := q.Client.CoreV1().ConfigMaps(q.Config.Kube.ConfigMapName).Get(context.TODO(), fmt.Sprintf("%s-%s", q.Config.Kube.ConfigMapName, q.Name), metav1.GetOptions{})
+func (q *Queue) GetQueueData() (idx []string, objects map[string]string, cm *v1.ConfigMap, err error) {
+	cmi, err := q.Client.CoreV1().ConfigMaps(q.Config.Kube.Namespace).Get(context.TODO(), fmt.Sprintf("%s-%s", q.Config.Kube.ConfigMapName, q.Name), metav1.GetOptions{})
 	if err != nil {
 		return nil, nil, cmi, err
 	}
 	// var idx []string <-- leave this for readability's sake
-	err = json.Unmarshal(cmi.BinaryData["idx"], &idx)
+	err = json.Unmarshal([]byte(cmi.Data["idx"]), &idx)
 	if err != nil {
 		return nil, nil, cmi, err
 	}
-	return idx, cmi.BinaryData, cmi, nil
+	return idx, cmi.Data, cmi, nil
 }
 
-func (q *Queue) WriteQueueData(configMap *v1.ConfigMap, data map[string][]byte) error {
-	configMap.BinaryData = data
-	_, err := q.Client.CoreV1().ConfigMaps(q.Config.Kube.ConfigMapName).Update(context.TODO(), configMap, metav1.UpdateOptions{})
+func (q *Queue) WriteQueueData(configMap *v1.ConfigMap, idx []string, data map[string]string) error {
+	idxb, err := json.Marshal(idx)
 	if err != nil {
 		return err
 	}
+	data["idx"] = string(idxb[:])
+	configMap.Data = data
+	cmList, err := q.Client.CoreV1().ConfigMaps(q.Config.Kube.Namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	exists := false
+	for item := range cmList.Items {
+		if cmList.Items[item].Name == fmt.Sprintf("%s-%s", q.Config.Kube.ConfigMapName, q.Name) {
+			exists = true
+		}
+	}
+	if !exists {
+		configMap.ResourceVersion = ""
+		_, err = q.Client.CoreV1().ConfigMaps(q.Config.Kube.Namespace).Create(context.TODO(), configMap, metav1.CreateOptions{})
+		if err != nil {
+			return err
+		}
+	} else {
+		_, err = q.Client.CoreV1().ConfigMaps(q.Config.Kube.Namespace).Update(context.TODO(), configMap, metav1.UpdateOptions{})
+		if err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -109,16 +140,34 @@ func (q *Queue) Push(i []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	idx = append(idx, hash)
-	idxb, err := json.Marshal(idx)
+	if !slices.Contains(idx, hash) {
+		idx = append(idx, hash)
+	}
+	objects[hash] = string(i[:])
+	err = q.WriteQueueData(cm, idx, objects)
 	if err != nil {
 		return "", err
 	}
-	objects["idx"] = idxb
-	objects[hash] = i
-	err = q.WriteQueueData(cm, objects)
-	if err != nil {
-		return "", err
-	}
+	q.Length = len(idx)
 	return hash, nil
+}
+
+func (q *Queue) Pop() ([]byte, error) {
+	idx, objects, cm, err := q.GetQueueData()
+	if err != nil {
+		return nil, err
+	}
+	if len(idx) == 0 {
+		return nil, fmt.Errorf("no items in queue to pop")
+	}
+	i := idx[0]
+	o := objects[i]
+	idx = append(idx[:0], idx[0+1:]...)
+	delete(objects, i)
+	err = q.WriteQueueData(cm, idx, objects)
+	if err != nil {
+		return nil, err
+	}
+	q.Length = len(idx)
+	return []byte(o), nil
 }
